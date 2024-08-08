@@ -56,6 +56,17 @@ import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.CRC32;
+import java.io.*;
+import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.Paths;
+import java.util.EnumSet;
+import java.nio.ByteOrder;
+import java.nio.MappedByteBuffer;
+import java.util.AbstractMap.SimpleEntry;
+
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
@@ -114,13 +125,33 @@ import org.apache.parquet.io.SeekableInputStream;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
 import org.apache.yetus.audience.InterfaceAudience.Private;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.json.JSONObject;
+import org.json.JSONArray;
+import org.newsclub.net.unix.AFUNIXSocketAddress;
+import org.newsclub.net.unix.AFUNIXSocket;
+
 
 /**
  * Internal implementation of the Parquet file reader as a block container
  */
 public class ParquetFileReader implements Closeable {
+
+  public class Pair<L, R> {
+    private final L left;
+    private final R right;
+  
+    public Pair(L left, R right) {
+      this.left = left;
+      this.right = right;
+    }
+  
+    public L getLeft() { return left; }
+    public R getRight() { return right; }
+  }
+  
 
   private static final Logger LOG = LoggerFactory.getLogger(ParquetFileReader.class);
 
@@ -684,6 +715,8 @@ public class ParquetFileReader implements Closeable {
 
   private InternalFileDecryptor fileDecryptor = null;
 
+  List<Long> allChunksIDs = new ArrayList<>();
+
   /**
    * @param configuration the Hadoop conf
    * @param filePath Path for the parquet file
@@ -996,6 +1029,128 @@ public class ParquetFileReader implements Closeable {
     return rowGroup;
   }
 
+  private ColumnChunkPageReadStore internalReadRowGroupUsingCache(int blockIndex) throws IOException {
+    if (blockIndex < 0 || blockIndex >= blocks.size()) {
+      return null;
+    }
+    BlockMetaData block = blocks.get(blockIndex);
+    if (block.getRowCount() == 0) {
+      throw new ParquetEmptyBlockException("Illegal row group of 0 rows");
+    }
+    ColumnChunkPageReadStore rowGroup = new ColumnChunkPageReadStore(block.getRowCount(), block.getRowIndexOffset());
+  
+    // Prepare the list of column chunks with descriptors
+    List<Pair<ChunkDescriptor, Pair<Long, Long>>> allColumnChunks = new ArrayList<>();
+    for (ColumnChunkMetaData mc : block.getColumns()) {
+      ColumnPath pathKey = mc.getPath();
+      ColumnDescriptor columnDescriptor = paths.get(pathKey);
+      if (columnDescriptor != null) {
+        BenchmarkCounter.incrementTotalBytes(mc.getTotalSize());
+        long startingPos = mc.getStartingPos();
+        ChunkDescriptor descriptor = new ChunkDescriptor(columnDescriptor, mc, startingPos, mc.getTotalSize());
+        allColumnChunks.add(new Pair<>(descriptor, new Pair<>(startingPos, mc.getTotalSize())));
+      }
+    }
+  
+    // Generate the request
+    JSONObject requestJson = new JSONObject();
+    requestJson.put("origin_file_path", file.toString());
+    JSONArray chunksArray = new JSONArray();
+    for (Pair<ChunkDescriptor, Pair<Long, Long>> chunk : allColumnChunks) {
+      JSONArray chunkArray = new JSONArray();
+      chunkArray.put(chunk.getRight().getLeft());
+      chunkArray.put(chunk.getRight().getRight());
+      chunksArray.put(chunkArray);
+    }
+    requestJson.put("column_chunk_offsets_lengths", chunksArray);
+  
+    // Serialize the request
+    byte[] requestBytes = requestJson.toString().getBytes("UTF-8");
+    byte[] sizeBuffer = ByteBuffer.allocate(4).putInt(requestBytes.length).array();
+    byte[] requestTypeBuffer = ByteBuffer.allocate(4).putInt(3).array(); // RequestType::ColumnChunkRequest
+  
+    // Establish a connection and send the request
+    String socketPath = "/tmp/crystal.sock";
+    File socketFile = new File(socketPath);
+    List<Pair<Long, Long>> allColumnChunksOffsetSize = new ArrayList<>();
+    List<Long> allChunksIDs = new ArrayList<>();
+    try (AFUNIXSocket socket = AFUNIXSocket.newInstance()) {
+      socket.connect(new AFUNIXSocketAddress(socketFile));
+
+      OutputStream outputStream = socket.getOutputStream();
+      outputStream.write(sizeBuffer);
+      outputStream.write(requestTypeBuffer);
+      outputStream.write(requestBytes);
+      outputStream.flush();
+  
+      // Read the response
+      InputStream inputStream = socket.getInputStream();
+      byte[] sizeBuffer2 = new byte[4];
+      reliableRead(inputStream, sizeBuffer2, 0, 4);
+      int responseSize = ByteBuffer.wrap(sizeBuffer2).order(ByteOrder.BIG_ENDIAN).getInt();
+  
+      byte[] responseBuffer = new byte[responseSize];
+      reliableRead(inputStream, responseBuffer, 0, responseSize);
+      String responseJson = new String(responseBuffer, "UTF-8");
+  
+      // Deserialize the response
+      JSONObject response = new JSONObject(responseJson);
+      JSONArray chunksArrayResponse = response.getJSONArray("column_chunk_offsets_lengths_column_chunk_ids");
+      for (int i = 0; i < chunksArrayResponse.length(); i++) {
+        JSONObject chunk = chunksArrayResponse.getJSONObject(i);
+        long offset = chunk.getLong("offset");
+        long length = chunk.getLong("length");
+        long id = chunk.getLong("id");
+        allColumnChunksOffsetSize.add(new Pair<>(offset, length));
+        allChunksIDs.add(id);
+      }
+    } catch (Exception e) {
+      throw new IOException("Error during communication with cache server: " + e.getMessage(), e);
+    }
+  
+    // Read data from shared memory
+    String shmName = "crystal_shm"; // Adjust as needed
+    try (FileChannel shmFileChannel = openSharedMemoryChannel(shmName)) {
+      ChunkListBuilder builder = new ChunkListBuilder(block.getRowCount());
+      for (int i = 0; i < allColumnChunksOffsetSize.size(); i++) {
+        Pair<Long, Long> chunkOffsetSize = allColumnChunksOffsetSize.get(i);
+        long offset = chunkOffsetSize.getLeft();
+        long size = chunkOffsetSize.getRight();
+        ByteBuffer buffer = mapSharedMemory(shmFileChannel, offset, size);
+        ChunkDescriptor descriptor = allColumnChunks.get(i).getLeft();
+        builder.add(descriptor, Arrays.asList(buffer), f);
+      }
+  
+      // Build and read chunks
+      for (Chunk chunk : builder.build()) {
+        readChunkPages(chunk, block, rowGroup);
+      }
+    }
+  
+    return rowGroup;
+  }
+  
+  private void reliableRead(InputStream inputStream, byte[] buffer, int offset, int length) throws IOException {
+    int bytesRead = 0;
+    int totalBytesRead = 0;
+  
+    while (totalBytesRead < length) {
+      bytesRead = inputStream.read(buffer, offset + totalBytesRead, length - totalBytesRead);
+      if (bytesRead == -1) {
+        throw new IOException("End of stream reached before reading all the data");
+      }
+      totalBytesRead += bytesRead;
+    }
+  }
+  
+  private FileChannel openSharedMemoryChannel(String shmName) throws IOException {
+    return FileChannel.open(Paths.get("/dev/shm", shmName), EnumSet.of(StandardOpenOption.READ));
+  }
+  
+  public static ByteBuffer mapSharedMemory(FileChannel shmFileChannel, long position, long size) throws IOException {
+    return shmFileChannel.map(FileChannel.MapMode.READ_ONLY, position, size);
+  }
+    
   /**
    * Reads all the columns requested from the specified row group. It may skip specific pages based on the column
    * indexes according to the actual filter. As the rows are not aligned among the pages of the different columns row
@@ -1443,14 +1598,43 @@ public class ParquetFileReader implements Closeable {
   @Override
   public void close() throws IOException {
     try {
+      // Send release requests to the cache system before closing resources
+      sendReleaseRequests();
+    } finally {
       if (f != null) {
         f.close();
       }
-    } finally {
       options.getCodecFactory().release();
     }
   }
-
+  
+  private void sendReleaseRequests() throws IOException {
+    if (allChunksIDs.isEmpty()) {
+      return;
+    }
+  
+    // Construct the release request
+    JSONObject requestJson = new JSONObject();
+    requestJson.put("column_chunk_id", new JSONArray(allChunksIDs));
+  
+    byte[] requestBytes = requestJson.toString().getBytes("UTF-8");
+    byte[] sizeBuffer = ByteBuffer.allocate(4).putInt(requestBytes.length).array();
+    byte[] requestTypeBuffer = ByteBuffer.allocate(4).putInt(4).array(); // RequestType::ReleaseColumnChunk
+  
+    String socketPath = "/tmp/crystal.sock";
+    File socketFile = new File(socketPath);
+    try (AFUNIXSocket socket = AFUNIXSocket.newInstance()) {
+      socket.connect(new AFUNIXSocketAddress(socketFile));
+      OutputStream outputStream = socket.getOutputStream();
+      outputStream.write(sizeBuffer);
+      outputStream.write(requestTypeBuffer);
+      outputStream.write(requestBytes);
+      outputStream.flush();
+    } catch (Exception e) {
+      throw new IOException("Error during communication with cache server: " + e.getMessage(), e);
+    }
+  }
+    
   /*
    * Builder to concatenate the buffers of the discontinuous parts for the same column. These parts are generated as a
    * result of the column-index based filtering when some pages might be skipped at reading.
