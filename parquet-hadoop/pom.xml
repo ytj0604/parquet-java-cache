@@ -195,11 +195,11 @@
       <artifactId>junixsocket-common</artifactId>
       <version>2.3.3</version>
     </dependency>
-    <!-- <dependency>
+    <dependency>
       <groupId>com.kohlschutter.junixsocket</groupId>
       <artifactId>junixsocket-native-common</artifactId>
       <version>2.3.3</version>
-    </dependency> -->
+    </dependency>
   </dependencies>
 
   <build>

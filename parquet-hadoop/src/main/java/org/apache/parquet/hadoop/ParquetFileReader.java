@@ -959,7 +959,7 @@ public class ParquetFileReader implements Closeable {
    * @return the PageReadStore which can provide PageReaders for each column.
    */
   public PageReadStore readRowGroup(int blockIndex) throws IOException {
-    return internalReadRowGroup(blockIndex);
+    return internalReadRowGroupUsingCache(blockIndex);
   }
 
   /**
@@ -970,7 +970,7 @@ public class ParquetFileReader implements Closeable {
   public PageReadStore readNextRowGroup() throws IOException {
     ColumnChunkPageReadStore rowGroup = null;
     try {
-      rowGroup = internalReadRowGroup(currentBlock);
+      rowGroup = internalReadRowGroupUsingCache(currentBlock);
     } catch (ParquetEmptyBlockException e) {
       LOG.warn("Read empty block at index {} from {}", currentBlock, getFile());
       advanceToNextBlock();
@@ -992,6 +992,9 @@ public class ParquetFileReader implements Closeable {
   }
 
   private ColumnChunkPageReadStore internalReadRowGroup(int blockIndex) throws IOException {
+    System.out.println("This function should not be called");
+    System.exit(1);
+
     if (blockIndex < 0 || blockIndex >= blocks.size()) {
       return null;
     }
@@ -1073,7 +1076,6 @@ public class ParquetFileReader implements Closeable {
     String socketPath = "/tmp/crystal.sock";
     File socketFile = new File(socketPath);
     List<Pair<Long, Long>> allColumnChunksOffsetSize = new ArrayList<>();
-    List<Long> allChunksIDs = new ArrayList<>();
     try (AFUNIXSocket socket = AFUNIXSocket.newInstance()) {
       socket.connect(new AFUNIXSocketAddress(socketFile));
 
@@ -1167,7 +1169,7 @@ public class ParquetFileReader implements Closeable {
 
     // Filtering not required -> fall back to the non-filtering path
     if (!options.useColumnIndexFilter() || !FilterCompat.isFilteringRequired(options.getRecordFilter())) {
-      return internalReadRowGroup(blockIndex);
+      return internalReadRowGroupUsingCache(blockIndex);
     }
 
     BlockMetaData block = blocks.get(blockIndex);
@@ -1213,10 +1215,10 @@ public class ParquetFileReader implements Closeable {
 
     if (rowCount == block.getRowCount()) {
       // All rows are matching -> fall back to the non-filtering path
-      return internalReadRowGroup(blockIndex);
+      return internalReadRowGroupUsingCache(blockIndex);
     }
 
-    return internalReadFilteredRowGroup(block, rowRanges, getColumnIndexStore(blockIndex));
+    return internalReadRowGroupUsingCache(blockIndex);
   }
 
   /**
@@ -1229,6 +1231,7 @@ public class ParquetFileReader implements Closeable {
    * @throws IOException if an error occurs while reading
    */
   public PageReadStore readNextFilteredRowGroup() throws IOException {
+    sendReleaseRequests();
     if (currentBlock == blocks.size()) {
       return null;
     }
@@ -1255,7 +1258,7 @@ public class ParquetFileReader implements Closeable {
       return readNextRowGroup();
     }
 
-    this.currentRowGroup = internalReadFilteredRowGroup(block, rowRanges, getColumnIndexStore(currentBlock));
+    this.currentRowGroup = internalReadRowGroupUsingCache(currentBlock);
 
     // avoid re-reading bytes the dictionary reader is used after this call
     if (nextDictionaryReader != null) {
@@ -1608,7 +1611,7 @@ public class ParquetFileReader implements Closeable {
     }
   }
   
-  private void sendReleaseRequests() throws IOException {
+  public void sendReleaseRequests() throws IOException {
     if (allChunksIDs.isEmpty()) {
       return;
     }
@@ -1630,6 +1633,7 @@ public class ParquetFileReader implements Closeable {
       outputStream.write(requestTypeBuffer);
       outputStream.write(requestBytes);
       outputStream.flush();
+      allChunksIDs.clear();
     } catch (Exception e) {
       throw new IOException("Error during communication with cache server: " + e.getMessage(), e);
     }
