@@ -9,7 +9,7 @@
 
   <groupId>org.apache.parquet</groupId>
   <artifactId>parquet</artifactId>
-  <version>1.13.1-tjyoon</version>
+  <version>1.13.1-tjyoon-record-statistics</version>
   <packaging>pom</packaging>
 
   <name>Apache Parquet MR</name>

@@ -926,7 +926,7 @@ public class ParquetFileReader implements Closeable {
    * @return the PageReadStore which can provide PageReaders for each column.
    */
   public PageReadStore readRowGroup(int blockIndex) throws IOException {
-    return internalReadRowGroupUsingCache(blockIndex);
+    return internalReadRowGroup(blockIndex);
   }
 
   /**
@@ -937,7 +937,7 @@ public class ParquetFileReader implements Closeable {
   public PageReadStore readNextRowGroup() throws IOException {
     ColumnChunkPageReadStore rowGroup = null;
     try {
-      rowGroup = internalReadRowGroupUsingCache(currentBlock);
+      rowGroup = internalReadRowGroup(currentBlock);
     } catch (ParquetEmptyBlockException e) {
       LOG.warn("Read empty block at index {} from {}", currentBlock, getFile());
       advanceToNextBlock();
@@ -959,9 +959,6 @@ public class ParquetFileReader implements Closeable {
   }
 
   private ColumnChunkPageReadStore internalReadRowGroup(int blockIndex) throws IOException {
-    System.out.println("This function should not be called");
-    System.exit(1);
-
     if (blockIndex < 0 || blockIndex >= blocks.size()) {
       return null;
     }
@@ -1015,7 +1012,7 @@ public class ParquetFileReader implements Closeable {
 
     // Filtering not required -> fall back to the non-filtering path
     if (!options.useColumnIndexFilter() || !FilterCompat.isFilteringRequired(options.getRecordFilter())) {
-      return internalReadRowGroupUsingCache(blockIndex);
+      return internalReadRowGroup(blockIndex);
     }
 
     BlockMetaData block = blocks.get(blockIndex);
@@ -1061,10 +1058,10 @@ public class ParquetFileReader implements Closeable {
 
     if (rowCount == block.getRowCount()) {
       // All rows are matching -> fall back to the non-filtering path
-      return internalReadRowGroupUsingCache(blockIndex);
+      return internalReadRowGroup(blockIndex);
     }
 
-    return internalReadRowGroupUsingCache(blockIndex);
+    return internalReadFilteredRowGroup(block, rowRanges, getColumnIndexStore(blockIndex));
   }
 
   /**
@@ -1077,7 +1074,6 @@ public class ParquetFileReader implements Closeable {
    * @throws IOException if an error occurs while reading
    */
   public PageReadStore readNextFilteredRowGroup() throws IOException {
-    sendReleaseRequests();
     if (currentBlock == blocks.size()) {
       return null;
     }
@@ -1104,7 +1100,7 @@ public class ParquetFileReader implements Closeable {
       return readNextRowGroup();
     }
 
-    this.currentRowGroup = internalReadRowGroupUsingCache(currentBlock);
+    this.currentRowGroup = internalReadFilteredRowGroup(block, rowRanges, getColumnIndexStore(currentBlock));
 
     // avoid re-reading bytes the dictionary reader is used after this call
     if (nextDictionaryReader != null) {
@@ -1454,6 +1450,7 @@ public class ParquetFileReader implements Closeable {
       options.getCodecFactory().release();
     }
   }
+
   /*
    * Builder to concatenate the buffers of the discontinuous parts for the same column. These parts are generated as a
    * result of the column-index based filtering when some pages might be skipped at reading.
