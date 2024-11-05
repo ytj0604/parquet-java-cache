@@ -123,12 +123,21 @@ import org.slf4j.LoggerFactory;
 public class ParquetFileReader implements Closeable {
 
   private static final Logger LOG = LoggerFactory.getLogger(ParquetFileReader.class);
+  private static final Logger STATS_LOG = LoggerFactory.getLogger("stats_logger");
 
   public static String PARQUET_READ_PARALLELISM = "parquet.metadata.read.parallelism";
 
   private final ParquetMetadataConverter converter;
 
   private final CRC32 crc;
+
+  private final String predicate_string;
+
+  private final String requested_schema_string;
+
+  private int read_bytes = 0;
+
+  Map<String, Integer> column_size_map = new HashMap<>();
 
   /**
    * for files provided, check if there's a summary file.
@@ -715,6 +724,8 @@ public class ParquetFileReader implements Closeable {
     this.file = HadoopInputFile.fromPath(filePath, configuration);
     this.fileMetaData = fileMetaData;
     this.f = file.newStream();
+    this.predicate_string = configuration.get("parquet.full.predicate.crystal");
+    this.requested_schema_string = configuration.get("parquet.schema.crystal");
     this.fileDecryptor = fileMetaData.getFileDecryptor();
     if (null == fileDecryptor) {
       this.options = HadoopReadOptions.builder(configuration).build();
@@ -766,6 +777,8 @@ public class ParquetFileReader implements Closeable {
     this.f = this.file.newStream();
     this.fileMetaData = footer.getFileMetaData();
     this.fileDecryptor = fileMetaData.getFileDecryptor();
+    this.predicate_string = conf.get("parquet.full.predicate.crystal");
+    this.requested_schema_string = conf.get("parquet.schema.crystal");
     if (null == fileDecryptor) {
       this.options = HadoopReadOptions.builder(conf).build();
     } else {
@@ -794,6 +807,8 @@ public class ParquetFileReader implements Closeable {
     this.converter = new ParquetMetadataConverter(options);
     this.file = file;
     this.f = file.newStream();
+    predicate_string = "";
+    requested_schema_string = "";
     this.options = options;
     try {
       this.footer = readFooter(file, options, f, converter);
@@ -975,6 +990,10 @@ public class ParquetFileReader implements Closeable {
       ColumnDescriptor columnDescriptor = paths.get(pathKey);
       if (columnDescriptor != null) {
         BenchmarkCounter.incrementTotalBytes(mc.getTotalSize());
+        read_bytes += mc.getTotalSize();
+        String columnKey = pathKey.toString();
+        column_size_map.put(columnKey, column_size_map.getOrDefault(columnKey, 0) + (int) mc.getTotalSize());
+
         long startingPos = mc.getStartingPos();
         // first part or not consecutive => new list
         if (currentParts == null || currentParts.endPos() != startingPos) {
@@ -1128,6 +1147,10 @@ public class ParquetFileReader implements Closeable {
             block.getRowCount());
         for (OffsetRange range : calculateOffsetRanges(filteredOffsetIndex, mc, offsetIndex.getOffset(0))) {
           BenchmarkCounter.incrementTotalBytes(range.getLength());
+          read_bytes += range.getLength();
+          String columnKey = pathKey.toString();
+          column_size_map.put(columnKey, column_size_map.getOrDefault(columnKey, 0) + (int) range.getLength());
+
           long startingPos = range.getOffset();
           // first part or not consecutive => new list
           if (currentParts == null || currentParts.endPos() != startingPos) {
@@ -1447,6 +1470,19 @@ public class ParquetFileReader implements Closeable {
         f.close();
       }
     } finally {
+      StringBuilder columnSizesJson = new StringBuilder("{");
+      for (Map.Entry<String, Integer> entry : column_size_map.entrySet()) {
+          if (columnSizesJson.length() > 1) {
+              columnSizesJson.append(", ");
+          }
+          columnSizesJson.append("\"").append(entry.getKey()).append("\": ").append(entry.getValue());
+      }
+      columnSizesJson.append("}");
+
+      if (!predicate_string.isEmpty()) {
+          STATS_LOG.info("{\"file\": \"{}\", \"predicate_string\": \"{}\", \"required_columns\": \"{}\", \"bytes_read\": {}, \"column_bytes_read\": {}}",
+            file.toString(), predicate_string, requested_schema_string, read_bytes, columnSizesJson.toString());
+      }
       options.getCodecFactory().release();
     }
   }
